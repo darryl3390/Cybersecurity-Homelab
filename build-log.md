@@ -274,5 +274,171 @@ New-ADUser `
 
 **Real-world relevance:** This mirrors how enterprise environments often segment management or update traffic onto a separate interface or VLAN from production/internal traffic — keeping the sensitive network isolated while still allowing controlled access for patching and tool installation.
 
+## Entry 012 — VM Storage Migration to External Drive
+
+**Date:** July 1, 2026
+**Status:** ✅ Complete
+
+**Action:** Used VirtualBox's built-in Move function to completely migrate all VM folders — including virtual disk files, snapshots, and configuration files — from the iMac internal storage to an external HDD. The migration was prompted by snapshot files accumulating on the host machine and consuming significant internal storage space.
+
+**Steps executed:**
+
+- Identified internal storage pressure caused by accumulated VM snapshots on the host machine
+- Powered down all VMs cleanly before initiating the move
+- Used VirtualBox Machine → Move function for each VM — this relocates the entire VM folder including virtual disks, snapshots, and configuration files in a single operation
+- Confirmed each VM's new path pointed to the external HDD after the move completed
+- Powered on each VM and confirmed normal operation from the external drive
+
+**Outcome:** All VM folders fully migrated to external HDD including snapshots. Internal storage space restored on the iMac host. No data loss or VM corruption during the migration. VirtualBox Move function handled all path updates automatically.
+
+**Lesson learned:** VirtualBox VMs are portable — the virtual disk files can be moved between storage locations as long as the VM settings are updated to reflect the new path. Powering down cleanly before moving files is critical to avoid disk corruption. This mirrors real-world scenarios where virtual machine storage is migrated between datastores or storage arrays in enterprise environments.
+
+**Real-world relevance:** Storage management is a routine operational task in enterprise IT environments. Virtual machines in production are regularly migrated between storage systems for capacity management, performance optimization, or hardware maintenance — all requiring careful planning and verification to avoid data loss or service interruption.
+
+---
+
+## Entry 013 — Full Network Vulnerability Scan with All VMs Active
+
+**Date:** July 1, 2026
+**Status:** ✅ Complete
+
+**Action:** Conducted a full vulnerability scan of the homelab.local network using Nessus Essentials with all VMs powered on simultaneously — DC01 (Windows Server 2025), WIN11 (Windows 11 Pro), Kali Linux, Ubuntu Desktop, and Ubuntu Server.
+
+**Steps executed:**
+
+- Powered on all VMs on the VirtualBox host-only network
+- Configured Nessus scan to target the full host-only subnet
+- Ran the scan and reviewed results across all active hosts
+
+**Findings:**
+
+**Finding 1 — Self-signed X.509 Certificate (Windows 11 Pro)**
+- Same finding as Entry 010 — Nessus web interface presenting a self-signed certificate
+- CVSS 3.0 Base Score: 6.5 (Medium)
+- Status: Accepted risk in lab environment — no action taken
+
+**Finding 2 — ICMP Timestamp Request/Reply Enabled (All VMs)**
+- Affected hosts: Windows 11 Pro, Kali Linux, Ubuntu Desktop, Ubuntu Server
+- CVSS 3.0 Base Score: 1.4 (Low)
+- Description: All active hosts were responding to ICMP timestamp requests (Type 13) and sending timestamp replies (Type 14). This allows a remote attacker to determine the system clock on targeted machines, which can be used to defeat time-based authentication protocols such as Kerberos — particularly relevant in an Active Directory environment where Kerberos is the primary authentication mechanism
+- Root cause: The broad ICMPv4 firewall rule created in Entry 005 permitted all ICMP types including timestamp requests and replies, not just echo requests (ping)
+- Remediation decision: Remediate — apply OS-specific firewall rules to block ICMP Types 13 and 14 on all affected hosts while preserving echo request (Type 8) functionality for connectivity testing
+
+**Outcome:** Full network scan completed with all VMs active. Two findings identified — one accepted, one flagged for immediate remediation. See Entry 014 for full remediation documentation.
+
+**Lesson learned:** Running a scan with all VMs powered on reveals a materially different attack surface than scanning a single host. The ICMP timestamp finding appeared on every Linux and Windows host simultaneously — a finding that would have been missed entirely in the single-VM scan from Entry 010. Full network scans should be standard practice, not an afterthought.
+
+**Real-world relevance:** In enterprise environments, vulnerability scans are run against the full network, not individual machines in isolation. A finding that affects every host simultaneously represents a systemic misconfiguration requiring coordinated remediation across multiple systems, which is exactly what this exercise produced.
+
+---
+
+## Entry 014 — ICMP Timestamp Vulnerability Remediation Across All VMs
+
+**Date:** July 2, 2026
+**Status:** ✅ Complete
+
+**Action:** Remediated the ICMP timestamp request/reply vulnerability (Entry 013, Finding 2) across all four affected VMs using OS-appropriate firewall methods. Each operating system required a different approach.
+
+**Remediation steps by VM:**
+
+**Windows 11 Pro:**
+
+- Deleted the original broad ICMPv4 rule from Entry 005:
+```
+netsh advfirewall firewall delete rule name="Allow ICMPv4"
+```
+- Added three specific replacement rules:
+```
+netsh advfirewall firewall add rule name="Allow ICMPv4-Echo" protocol=icmpv4:8,any dir=in action=allow
+netsh advfirewall firewall add rule name="Block ICMPv4-Timestamp-In" protocol=icmpv4:13,any dir=in action=block
+netsh advfirewall firewall add rule name="Block ICMPv4-Timestamp-Out" protocol=icmpv4:14,any dir=out action=block
+```
+- Persistence method: Native Windows Defender Firewall — rules persist automatically across reboots
+
+**Kali Linux:**
+
+- Added DROP rules via iptables using named ICMP types:
+```
+sudo iptables -A INPUT -p icmp --icmp-type timestamp-request -j DROP
+sudo iptables -A OUTPUT -p icmp --icmp-type timestamp-reply -j DROP
+```
+- Issue encountered: OUTPUT rule initially written as Type 13 instead of Type 14 — identified via `iptables -L -n -v` and corrected by deleting the incorrect rule and re-adding with the correct type
+- Persistence method: iptables-persistent package
+```
+sudo apt install iptables-persistent -y
+sudo netfilter-persistent save
+```
+
+**Ubuntu Desktop:**
+
+- Added DROP rules via iptables using numeric ICMP types (named type syntax not supported on this Ubuntu version):
+```
+sudo iptables -A INPUT -p icmp --icmp-type 13 -j DROP
+sudo iptables -A OUTPUT -p icmp --icmp-type 14 -j DROP
+```
+- Persistence method: iptables-persistent package
+```
+sudo apt install iptables-persistent -y
+sudo netfilter-persistent save
+```
+
+**Ubuntu Server:**
+
+- Added DROP rules via iptables using numeric ICMP types:
+```
+sudo iptables -A INPUT -p icmp --icmp-type 13 -j DROP
+sudo iptables -A OUTPUT -p icmp --icmp-type 14 -j DROP
+```
+- Issue encountered: iptables-persistent could not be installed — repository package lists were missing and the update process was disabled due to unsigned repository sources. Did not use `--allow-unauthenticated` flag due to security risk
+- Persistence method: Manual save and startup script
+```
+sudo mkdir -p /etc/iptables
+sudo sh -c "iptables-save > /etc/iptables/rules.v4"
+sudo nano /etc/network/if-pre-up.d/iptables
+```
+- Script contents:
+```
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+```
+```
+sudo chmod +x /etc/network/if-pre-up.d/iptables
+```
+- Verified executable: `-rwxr-xr-x 1 root root 52`
+
+**Verification:**
+
+- Ran follow-up Nessus scan across full network with all VMs active
+- ICMP timestamp finding cleared on all four hosts
+- Ping (ICMP Type 8 echo) confirmed still working between VMs — connectivity preserved
+- SSL certificate finding on Windows 11 persists as expected — accepted risk, no action taken
+
+**Outcome:** ICMP timestamp vulnerability fully remediated across all VMs. Each OS required a different implementation approach — Windows Firewall rules, iptables-persistent on Kali and Ubuntu Desktop, and a manual save with startup script on Ubuntu Server. Full remediation cycle completed: scan → identify → remediate → verify.
+
+**Lesson learned:** The same vulnerability requires different remediation approaches depending on the operating system. On Linux, iptables syntax also varies between distributions — named ICMP types worked on Kali but required numeric types on Ubuntu. Always verify rule syntax with `iptables -L -n -v` after adding rules, and confirm persistence separately from rule creation — adding rules and saving rules are not the same action.
+
+**Real-world relevance:** In enterprise environments, a finding affecting multiple systems with different operating systems requires coordinated remediation across different teams and toolsets. The Ubuntu Server repository issue mirrors a real-world scenario where a system's package manager is misconfigured or behind on maintenance, requiring a workaround rather than the standard installation path.
+
+## Entry 015 — Full VM Migration to External HDD Using VirtualBox Move Function
+
+**Date:** July 7, 2026
+**Status:** ✅ Complete
+
+**Action:** Performed a complete migration of all VM folders from the iMac internal storage to an external HDD using VirtualBox's built-in Move function. This move was prompted by accumulated snapshot files consuming significant internal storage space on the host machine — a follow-up to the partial migration documented in Entry 012.
+
+**Steps executed:**
+
+- Identified continued internal storage pressure caused by snapshot files that had been collecting on the host machine since the lab was first built
+- Powered down all VMs cleanly before initiating the move
+- Used VirtualBox Machine → Move for each VM — this function relocates the entire VM folder including virtual disk files, snapshots, and configuration files in a single operation and automatically updates all internal VirtualBox path references
+- Confirmed each VM's new path pointed to the external HDD after each move completed
+- Powered on each VM and confirmed normal operation from the external HDD
+
+**Outcome:** All VM folders fully migrated to external HDD including snapshots and configuration files. Internal storage space fully restored on the iMac host. No data loss or VM corruption during the migration. VirtualBox Move function handled all path updates automatically — no manual reconfiguration required.
+
+**Lesson learned:** VirtualBox's Move function is the correct tool for a complete VM relocation — it moves the entire VM folder and updates all internal references in one operation. This is preferable to manually moving files and updating paths separately, which risks breaking references if any path is missed. Snapshot management should be part of routine lab hygiene — snapshots accumulate quickly and consume significant storage if not monitored.
+
+**Real-world relevance:** Storage capacity management is a routine operational responsibility in enterprise IT environments. Virtual machines in production are regularly migrated between storage systems for capacity management, performance optimization, or hardware refresh cycles. Knowing when to move workloads and how to do so cleanly without data loss or service interruption is a foundational sysadmin skill.
+
 ---
 *Log continues as the lab grows. Every new configuration, exercise, troubleshooting event, and rebuild is documented here.*
