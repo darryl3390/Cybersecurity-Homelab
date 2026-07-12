@@ -440,5 +440,122 @@ sudo chmod +x /etc/network/if-pre-up.d/iptables
 
 **Real-world relevance:** Storage capacity management is a routine operational responsibility in enterprise IT environments. Virtual machines in production are regularly migrated between storage systems for capacity management, performance optimization, or hardware refresh cycles. Knowing when to move workloads and how to do so cleanly without data loss or service interruption is a foundational sysadmin skill.
 
+
+## Entry 016 — Splunk Enterprise SIEM Deployment
+
+**Date:** July 11, 2026
+**Status:** ✅ Complete
+
+**Action:** Deployed Splunk Enterprise 10.4.1 on the defender Ubuntu Server and configured Universal Forwarders on DC01, WIN11, and Ubuntu Desktop to centralize log collection across the `homelab.local` environment.
+
+**Goal:** Establish a working SIEM to support log analysis and baseline "normal" authentication/process activity, in support of SOC Analyst Tier 1 skill-building.
+
+---
+
+### Splunk Enterprise install (defender Ubuntu Server)
+
+Downloaded Splunk Enterprise 10.4.1 using the signed wget command provided directly on the splunk.com download page (a time-limited, tokenized URL — works directly via `wget` on a headless server, no browser session required). Installed via `dpkg -i`.
+
+**Problem encountered:** Splunk 10.4 no longer allows running as the root user by default. Initial start used the `--run-as-root` flag to get past this quickly, which worked but is not the recommended configuration.
+
+**Resolution:** Stopped the instance, created a dedicated non-root `splunk` user, transferred ownership of `/opt/splunk` to that user (`chown -R splunk:splunk`), and restarted explicitly as that user (`sudo -u splunk /opt/splunk/bin/splunk start`). Verified via `ps -ef | grep splunkd` showing the process owned by `splunk`, and confirmed the root-deprecation warning no longer appeared on subsequent starts.
+
+Admin Web credentials were created during the initial start prompt (separate from the `splunk` Linux system account).
+
+Enabled receiving on port 9997 via Settings → Forwarding and receiving → Configure receiving.
+
+**Verified:** Web UI accessible from Ubuntu Desktop at `http://<SPLUNK_IP>:8000` — no firewall issue encountered on this port specifically.
+
+---
+
+### DC01 (Windows Server 2025) forwarder
+
+Installed the Universal Forwarder with: service account = Local System; Event Logs = Application, Security, System; Active Directory monitoring = enabled; Deployment Server = skipped; Receiving Indexer = `<SPLUNK_IP>:9997`.
+
+**Problem encountered:** AD monitoring required separate authentication. Used the domain Administrator account to satisfy this. Noting for the record that this is broader access than the task needs — a dedicated service account with delegated read-only AD permissions would be the correct least-privilege choice in a production environment; used Administrator here for lab expediency.
+
+**Problem encountered:** `Test-NetConnection -ComputerName <SPLUNK_IP> -Port 9997` from DC01 returned `False`. Root cause: `ufw` on the Splunk server was blocking port 9997 by default, despite all traffic being confined to the isolated Host-Only network. Resolved with `sudo ufw allow 9997/tcp`. Re-ran the test — returned `True`.
+
+**Verified:** `index=main host=DC01` returning events in Search & Reporting.
+
+**Pattern noted:** `ufw` blocks each new Splunk-related port by default. Checking `ufw status` proactively before troubleshooting further is now the standing approach for any new port introduced going forward (port 8089 is the likely next one, if remote management is used later).
+
+---
+
+### WIN11 forwarder
+
+**Problem encountered:** Universal Forwarder installer returned "this account does not have admin privileges." Investigated further — traced to a broader AD structure issue:
+
+**Root cause:** WIN11 was sitting in the default Active Directory "Computers" container, which is invisible to Group Policy Management (GPOs can only link to Organizational Units, never the default container). A Restricted Groups GPO built earlier to grant a dedicated admin account local admin rights on workstations had no way to reach WIN11 as a result.
+
+**Resolution attempted:** Moved WIN11 into a new `Workstations` OU (via Active Directory Users and Computers) and linked the Restricted Groups GPO to it. Ran `gpupdate /force`. Privilege elevation still did not take effect on first test.
+
+**Workaround used to proceed:** Logged into WIN11 with the domain Administrator account to complete the forwarder install rather than block progress further.
+
+**Open item:** Restricted Groups still not confirmed working on WIN11 as of this entry. To revisit: check `gpresult /r` on WIN11 for whether the GPO is actually applying now that domain admin rights (see below) are in place; if applying but still not granting rights, check for a conflicting "Deny log on locally" entry. A non-functioning security policy left in place risks false confidence about what's actually enforced and should be fixed or removed cleanly rather than left ambiguous.
+
+Installed forwarder (via Administrator account): Local System; Application/Security/System event logs; AD monitoring not offered (not a domain controller); Deployment Server skipped; Receiving Indexer `<SPLUNK_IP>:9997`.
+
+**Verified:** connectivity test returned `True` immediately (port already open from the DC01 fix). `index=main host=WIN11` returning events.
+
+---
+
+### Ubuntu Desktop forwarder
+
+**Problem encountered:** First attempt to configure the forwarder (`add forward-server`, `add monitor`) failed with "user splunk not found." Investigation showed the forwarder wasn't actually installed on this machine at all — `dpkg -l | grep splunk` returned nothing, and `find / -iname "splunkforwarder*.deb"` found no installer file anywhere on disk. The install had never actually completed here; each machine requires its own independent download.
+
+**Resolution:** Re-downloaded via the same signed wget pattern used on the indexer, run directly on Ubuntu Desktop.
+
+**Problem encountered:** Subsequent `dpkg -i` failed because the command referenced an assumed filename rather than the file that actually downloaded. Resolved by running `ls *.deb` to confirm the real filename before installing.
+
+Created a dedicated `splunk` user on this machine (local OS accounts don't carry over between VMs — this had to be repeated fresh, separate from the indexer's `splunk` user), transferred ownership of `/opt/splunkforwarder`, and started the forwarder as that user.
+
+**Problem encountered:** `enable boot-start -user splunk` failed with "permission denied" when run as `sudo -u splunk`. Root cause: writing the systemd service file to `/etc/systemd/system/` requires root, regardless of `/opt/splunkforwarder` ownership. Resolved by running this one specific command as plain `sudo` (not `sudo -u splunk`) while still passing `-user splunk` — the one legitimate exception to the "always run as splunk" rule in this deployment, since it modifies system-level startup configuration rather than the Splunk process itself. A follow-up "command not found" on retry was traced to a typo, not a real issue.
+
+**Problem encountered:** Expected log paths `/var/log/syslog` and `/var/log/auth.log` did not populate as expected. Checked for `ufw` to rule out a firewall block — found `ufw` isn't installed at all on this Ubuntu Desktop image (unlike Ubuntu Server), so no firewall rules were needed for outbound connectivity. Continued investigating — the file/path naming turned out to differ from what was assumed, and the actual reporting hostname for this VM is `unumtu-desktop` (apparent typo from original VM naming, confirmed as the literal hostname rather than a transcription error). Once the correct host was identified, the already-registered `add monitor` config picked up the log data without needing to be re-added.
+
+**Verified:** `index=main host=unumtu-desktop` returning events.
+
+---
+
+### Domain-wide audit policy (GPO)
+
+Given AD DS was already in place, chose to enable richer auditing centrally via GPO rather than local policy per machine. Edited the Default Domain Policy → Computer Configuration → Windows Settings → Security Settings → Advanced Audit Policy Configuration, enabling:
+- Logon/Logoff → Audit Logon (Success and Failure)
+- Detailed Tracking → Audit Process Creation (Success)
+- Account Logon → Audit Kerberos Authentication Service (Success and Failure)
+
+**Problem encountered:** "Computer Configuration" did not appear at all in the Group Policy Management Editor on first attempt. `gpresult /r /scope:computer` on DC01 showed "N/A" for Applied Group Policy Objects, confirming the logged-in account lacked sufficient rights to view or edit domain-level policy.
+
+**Root cause:** the account being used was not a member of Domain Admins.
+
+**Resolution:** Added the dedicated admin account to Domain Admins via Active Directory Users and Computers, then logged off and back on (group membership changes require a fresh logon, not just `gpupdate`). Confirmed via `whoami /groups` showing `HOMELAB\Domain Admins`. Computer Configuration was then fully visible and editable.
+
+**Note on scope:** chose full Domain Admins since this account is intended as an ongoing admin account, not a one-time fix. For read-only GPO result viewing specifically, a delegated "Generate Resultant Set of Policy (Logging)" right would have been the stricter least-privilege option — noted for future reference.
+
+This also resolves the open item from the WIN11 forwarder install above — the Restricted Groups GPO configuration issue likely traced to the same underlying rights gap. Worth re-testing now that Domain Admin rights are in place.
+
+Ran `gpupdate /force` on DC01 and WIN11 following the policy change.
+
+**Verified:** `index=main EventCode=4688` (Process Creation, previously empty) and `index=main EventCode=4624 host=DC01` both returned events after the policy applied.
+
+---
+
+### Verification and dashboards
+
+Ran `index=main | stats count by host` — confirmed `DC01`, `WIN11`, and `unumtu-desktop` all reporting.
+
+Built a Dashboard Studio dashboard (`SOC Baseline`, Grid layout) with three panels:
+1. Domain authentication activity — `index=main (EventCode=4624 OR EventCode=4625) host=DC01`
+2. Process creation across endpoints — `index=main EventCode=4688 | table _time, host, Account_Name, New_Process_Name | sort -_time` (table)
+3. Linux auth activity — `index=main host=unumtu-desktop ("Failed password" OR "session opened") | table _time, host, _raw | sort -_time` (table)
+
+**Outcome:** Full Splunk SIEM deployment complete. Splunk Enterprise 10.4.1 running as a non-root user on the defender Ubuntu Server. Three Universal Forwarders (DC01, WIN11, Ubuntu Desktop) confirmed sending data. Domain-wide audit policy enabled via GPO, enriching Windows event data with logon, process creation, and Kerberos detail. One working baseline dashboard built with three panels covering domain authentication, process creation, and Linux authentication activity.
+
+**Lesson learned:** this build surfaced far more troubleshooting than a clean install would have, and nearly all of it maps onto real enterprise patterns rather than lab-only quirks: Splunk 10.4's root-execution deprecation and its one systemd-related exception; `ufw` silently blocking new ports by default on Ubuntu Server while being absent entirely on Ubuntu Desktop; new AD-joined machines landing in the default Computers container and staying invisible to Group Policy Management until moved to a proper OU; local admin rights and Domain Admin rights being distinct, non-interchangeable requirements, with group membership changes needing a fresh logon rather than a policy refresh; each machine requiring a fully independent install and non-root user setup with nothing carrying over between hosts; and assumed standard Linux log paths and hostnames not holding up without direct verification. Nearly every step that "should have just worked" surfaced a real, documentable gotcha.
+
+**Real-world relevance:** Centralizing log collection from a domain controller and its member workstations mirrors how enterprise SOCs ingest Windows Event Logs at scale — DC-level authentication logs are typically the highest-value source in any AD environment, since Kerberos ticket activity touches every domain resource access. The troubleshooting throughout this entry — non-root service accounts, firewall rule management, AD OU/GPO structure, and least-privilege account design — reflects the actual day-to-day skill set of a SOC/security engineer working in a real Windows/AD enterprise environment, arguably more so than the SIEM configuration itself.
+
+
 ---
 *Log continues as the lab grows. Every new configuration, exercise, troubleshooting event, and rebuild is documented here.*
