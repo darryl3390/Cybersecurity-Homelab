@@ -1,6 +1,7 @@
 # Homelab Build Log
 
 *Ordered newest first. New entries are added at the top of their phase's section going forward.*
+
 **Owner:** Darryl Briggs  
 **Goal:** Build a functioning enterprise-style network to develop hands-on cybersecurity and IT skills in support of CompTIA certifications and a career transition into GRC and cybersecurity engineering.  
 **Host:** iMac 2017 — Intel Core i7 — 48GB RAM — VirtualBox  
