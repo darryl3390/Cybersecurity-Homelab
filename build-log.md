@@ -146,7 +146,7 @@ Identified a second Ubuntu Server VM present in the environment with no memory o
 **Issue:** pfSense VDI reported "inaccessible," VM failed to boot.
 
 **Root cause investigation:**
-- Ruled out external SSD mount timing and Virtual Media Manager stale references
+- Ruled out external HDD mount timing and Virtual Media Manager stale references
 - Confirmed the actual cause: external drive (exFAT format) was showing "Custom" permissions rather than Read & Write
 - `chmod -R 775` initially failed with "Operation not permitted" — traced to Terminal lacking Full Disk Access
 - Path also contained a space in the drive name, causing a secondary "No such file or directory" error until the path was quoted
