@@ -12,6 +12,116 @@
 
 # Phase 2 — Segmented Architecture
 
+## Phase 2, Entry 002 — Session 2: VM Migration onto Segments
+
+**Date:** July 14, 2026
+**Status:** ✅ Complete
+
+**Action:** Migrated all five existing VMs (DC01, WIN11, Ubuntu Desktop, Kali, Ubuntu Server) off the original flat network and onto their designated segments behind pfSense, then reconfigured all Splunk Universal Forwarders to point at Ubuntu Server's new address.
+
+**Goal:** Complete the segmentation groundwork established in Entry 001 — every VM now sits on its intended zone (ATTACK/AD_LAB/DEFENDER), with pfSense as the only path between them.
+
+---
+
+### Step 1 — Snapshot strategy
+
+Skipped a blanket pre-migration snapshot across all VMs as redundant, given a pre-pfSense snapshot already existed. Made one deliberate exception: **snapshotted DC01 specifically** before its migration, given Entry 009's history — a network-adjacent change to this exact VM previously cascaded into a full AD rebuild with no clean recovery path. Treated as targeted risk management, not blanket process.
+
+### Step 2 — DC01 migration
+
+Migrated to `intnet-adlab` with a static IP, gateway pointed at pfSense's LAN interface. Completed without incident.
+
+### Step 3 — WIN11 migration and DNS dependency
+
+- Set WIN11's static DNS to DC01's new AD_LAB address — required specifically because WIN11 is domain-joined (Kerberos/Group Policy depend on locating DC01 via DNS). Sequenced **after** DC01's migration was confirmed up, to avoid pointing WIN11 at a stale or nonexistent address.
+- Migrated adapter to `intnet-adlab`, assigned static IP, same gateway as DC01.
+
+**Problem encountered:** WIN11 became severely sluggish post-migration. Task Manager showed **100% CPU / 86% memory** at idle, while macOS Activity Monitor on the host showed no overload — confirming the bottleneck was WIN11's own allocation (2 vCPU/4GB, Microsoft's bare documented minimum), not the host.
+
+**Resolution:** Removed FileZilla (unrelated leftover software from an earlier project) and bumped WIN11 to 3 vCPU/8GB RAM. Performance improved meaningfully, though not dramatically — expected given VM overhead, Windows 11's baseline weight, and constant domain-related background activity (GPO refresh, Kerberos ticket renewal) layered on top.
+
+**Verified:** `nslookup homelab.local` resolves via DC01, domain login succeeds, `ping` to DC01's AD_LAB address succeeds.
+
+**Problem encountered (separate, discovered afterward):** DC01 had been shut down earlier to conserve host resources, which broke WIN11's general internet access — not just domain functionality.
+
+**Root cause:** WIN11's DNS is pointed solely at DC01 with no secondary resolver. Since **all** DNS resolution routes through DC01 (not just internal `homelab.local` lookups), losing DC01 blocks general internet browsing too, even though the underlying network path to WAN is unaffected. The symptom ("no internet") was actually "no DNS."
+
+**Resolution / standing decision:** Treat DC01 and WIN11 as a bundled pair going forward rather than independently rotatable — WIN11 cannot be used meaningfully for domain-dependent exercises, or general browsing, with DC01 powered off.
+
+### Step 4 — Ubuntu Desktop verification
+
+Already migrated onto `intnet-adlab` as an incidental side effect of Entry 001's GUI-access troubleshooting. Re-verified static IP and gateway were still correctly set; no changes needed. Confirmed no requirement to match DC01's DNS, since Ubuntu Desktop isn't domain-joined.
+
+### Step 5 — Kali migration
+
+Bumped Kali's allocation to match WIN11 (3 vCPU/8GB, up from 2/4) for reliability, matching the same "bare-minimum isn't enough in practice" lesson from Step 3. Noted this raises the Kali+WIN11 Standard-session pairing to 9 vCPU against the host's 8 threads — one over budget, accepted as a minor, known trade-off rather than reallocating further.
+
+Migrated adapter to `intnet-attack`, assigned static IP via GUI. DNS left blank — no domain dependency, matching Ubuntu Desktop's reasoning.
+
+**Problem encountered:** After setting the static IP via GUI, the old IP address remained active alongside the new one even after `sudo systemctl restart NetworkManager` (the fix that resolved a similar issue in Entry 004).
+
+**Root cause:** NetworkManager had applied the new address without releasing the old one — a lingering DHCP-style artifact.
+
+**Resolution:** `sudo ip addr flush dev <interface>` to clear all addresses on the interface, followed by bringing the connection back up. Confirmed via `ip a` showing only the new address.
+
+**Expected, not a problem:** `ping` from Kali to pfSense's OPT1 (ATTACK) interface failed. Confirmed via `ip route` that routing/gateway configuration was correct. Root cause: OPT interfaces in pfSense carry **zero rules by default** (unlike LAN, which gets an automatic "allow to any" rule) — this is default-deny working exactly as designed, not a misconfiguration. Decision made to leave this unaddressed until Entry 003 (firewall rules) rather than add a temporary rule now.
+
+### Step 6 — Ubuntu Server (Splunk/DEFENDER) migration
+
+Snapshotted before starting. Edited Netplan config: static IP, route, and empty `nameservers` (same no-DNS-dependency reasoning as Kali/Ubuntu Desktop).
+
+**Problem encountered:** After applying, `ip route` showed the default gateway as the **network address** (`.0`) rather than pfSense's actual OPT2 interface address — a Netplan `routes: via:` typo, separate from the interface's own static address (which was correctly set).
+
+**Resolution:** Corrected `via:` to the actual gateway IP. Clarified in the process: `via:` takes a single plain IP with no subnet suffix (subnet notation belongs on `addresses:` only); `to: default` already covers all-destinations scope.
+
+**Problem encountered:** `curl http://localhost:8000` failed to connect. Initial troubleshooting incorrectly suspected the network/route change; actual cause was unrelated — **Splunk itself was not running** (`splunk status` confirmed `splunkd` down). Localhost traffic never leaves the host, so this was never a network/segmentation issue at all.
+
+**Resolution:** Started Splunk as the non-root `splunk` user (consistent with Entry 016's original setup). Configured boot-start persistence with `splunk enable boot-start -user splunk` — the `-user` flag is required here specifically because this deployment runs Splunk as a dedicated non-root user, not the plain root-default boot-start command. Verified via `systemctl status Splunkd` (enabled) and a full reboot test, confirming `splunkd` came back up automatically and owned by `splunk`, not `root`.
+
+**Verified:** `curl http://localhost:8000` succeeded post-fix.
+
+### Step 7 — Forwarder reconfiguration (DC01, WIN11, Ubuntu Desktop)
+
+**Problem encountered:** Attempted `splunk edit forward-server <old>:9997 -new <new>:9997` — `edit` is not a valid action for this command; only `add`, `remove`, and `list` are supported.
+
+**Resolution:** Standardized on `list forward-server` (confirm current value) → `remove forward-server <old>` → `add forward-server <new>` → `list forward-server` (confirm change) → `restart`, applied identically across all three hosts (PowerShell syntax on DC01/WIN11, bash on Ubuntu Desktop).
+
+**Observed:** Immediately after reconfiguration, DC01's forwarder showed **"configured but not active."** Expected at that moment, given DEFENDER (OPT2) had no allow rule yet. After a forwarder service restart, it flipped to **active** — sooner than expected.
+
+**Root cause (significant finding):** pfSense evaluates firewall rules based on the **ingress** interface, not the destination. Traffic from DC01 (AD_LAB/LAN) enters on **LAN**, which — unlike ATTACK/DEFENDER (OPT interfaces, zero rules by default) — automatically received a default **"allow LAN net to any"** rule when it was configured. This meant AD_LAB→DEFENDER traffic was already succeeding, but via LAN's overly permissive default, not because a deliberate rule existed yet. The same default rule means **AD_LAB currently has open access to WAN and everything else** — segmentation is not yet actually enforced on traffic originating from AD_LAB.
+
+**Implication carried into Entry 003:** the next session isn't just "add allow rules to OPT interfaces" — it must also actively **replace LAN's default permissive rule** with the specific intended rule set (AD_LAB→DEFENDER allow, AD_LAB→WAN block, default deny after). Flagged explicitly so this isn't mistaken for "segmentation already works."
+
+Repeated the same remove/add/list/restart sequence on WIN11 and Ubuntu Desktop with the same outcome.
+
+### Step 8 — Forwarder verification tooling
+
+**Splunk's Forwarder Management page was not present** — expected, since Entry 016 documented Deployment Server as skipped during install, and that page is a Deployment Server feature.
+
+Verified forwarders instead via `index=main | stats count by host` (all three present), then confirmed **currency** (not stale historical data) by re-running with a narrowed time range (last 15–60 minutes) — same three hosts still present within that window, confirming live, current reporting.
+
+Located **Monitoring Console → Forwarder Monitoring** as the intended purpose-built view. Confirmed **Standalone mode** (not Distributed) is correct — Distributed mode governs multiple full Splunk Enterprise instances, and Universal Forwarders don't count toward that regardless of how many are connected. Left the **data collection interval at its 15-minute default**, appropriate given only 3 forwarders and no cost concern at this scale.
+
+**Enhancement:** Added a custom panel to the existing **SOC Baseline** dashboard (Dashboard Studio) reflecting forwarder connectivity. Considered pulling from the same lookup backing the Monitoring Console view (`| inputlookup dmc_forwarder_assets.csv`), but chose a true real-time query directly against `metrics.log` instead, since it doesn't wait on the 15-minute collection interval:
+```
+index=_internal source=*metrics.log group=tcpin_connections | stats latest(_time) as last_seen by sourceHost, hostname
+```
+set to a real-time (5-minute window) time range. Noted this is one of the few cases where continuous real-time search mode is actually appropriate rather than resource-wasteful, given the small, fixed number of forwarders involved. Titled the panel **"Forwarder connectivity status (live)."**
+
+### Step 9 — Unrelated cleanup: orphaned VM
+
+Identified a second Ubuntu Server VM present in the environment with no memory of its original purpose and no ties to the current network configuration or any active segment. Investigated briefly (installed packages, running services, hostname) before acting rather than deleting blind; found nothing indicating it was in use or part of a planned build. Snapshotted, then removed via VirtualBox (Remove → Delete all files) to reclaim disk space. Not connected to any Phase 2 segment at any point, so no impact on the migration work above.
+
+---
+
+**Outcome:** All five VMs now correctly reside on their designated segments. All three Splunk forwarders successfully reconfigured and confirmed reporting, though currently via LAN's unintended permissive default rather than deliberate rule design — a gap explicitly carried forward into Entry 003. Custom real-time forwarder connectivity panel added to the SOC Baseline dashboard.
+
+**Lesson learned:** This session repeatedly surfaced the same underlying theme — verifying assumptions rather than trusting that a setting "should" work. Vendor-minimum VM specs (WIN11, Kali) proved insufficient in practice despite meeting documented minimums; NetworkManager silently left a stale IP in place after a GUI change; a Netplan gateway typo was mistaken for a network problem when the real fault was a service that simply wasn't running; and most significantly, forwarder connectivity succeeding before firewall rules existed masked a fundamental gap — LAN's default permissive rule — that could easily have been mistaken for "segmentation is working" instead of correctly identified as "segmentation on this interface hasn't started yet." Confirming *why* something works is as important as confirming *that* it works.
+
+**Real-world relevance:** Several patterns here mirror real enterprise operations directly: right-sizing VM/instance resources against observed load rather than vendor-stated minimums; the operational risk of a single point of DNS dependency in a domain environment; correct systemd service configuration for services intentionally run as non-root; and — most transferable to a SOC/security engineering context — the exact failure mode this session caught: assuming a security boundary is enforced because *some* interfaces are locked down, when a default or legacy rule elsewhere (LAN, in this case) can silently undermine the entire segmentation model. Catching that before Entry 003's rule-writing, rather than after, is precisely the kind of verification discipline real firewall audits are designed to catch.
+
+---
+
 ## Phase 2, Entry 001 — pfSense Deployment: Network Segmentation Firewall/Router
 
 **Date:** July 14, 2026
