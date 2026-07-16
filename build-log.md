@@ -12,6 +12,163 @@
 
 # Phase 2 — Segmented Architecture
 
+## Phase 2, Entry 004 — Session 4: Positive/Negative Detection Testing
+
+**Date:** July 15, 2026
+**Status:** ✅ Complete (core objective) — ⬜ Deferred (host-layer logging enhancement)
+
+**Action:** Ran the first real positive and negative detection tests against the segmented architecture — confirming an attack is actually detected and a blocked path is actually enforced, rather than just configured.
+
+**Goal:** Verify Session 3's rule set under live conditions: does ATTACK→AD_LAB traffic actually get seen, and does AD_LAB→WAN actually get stopped.
+
+---
+
+### Step 1 — Scoping the session's resource footprint
+
+Considered running all six VMs simultaneously (all were already up from earlier work) and briefly treated this as an informal "stress test." On reflection, discarded that framing — an unstructured stress test with no baseline or defined metrics isn't rigorous enough to be worth pursuing deliberately, and risked confounding the actual security-verification results with unrelated performance noise. Powered off DC01 and WIN11 (not needed for this session's tests) and proceeded with a 4-VM footprint (pfSense, Splunk, Kali, Ubuntu Desktop) — sustainable without throttling, and a cleaner signal for the tests that mattered.
+
+### Step 2 — Positive test: attack generation
+
+Selected Ubuntu Desktop as the AD_LAB test target (no domain dependency, unlike DC01/WIN11 — avoids the Session 2 DNS single-point-of-failure entirely). Originally planned an SSH brute-force test, but SSH could not be installed on Ubuntu Desktop — AD_LAB's explicit WAN block (Entry 003) correctly prevented the package download, confirming the block rule extends beyond DNS to all outbound traffic. Switched to an Nmap scan instead, which requires no new installation on the target:
+```
+nmap -sV -T4 <ubuntu-desktop-ip>
+```
+
+### Step 3 — Positive test: detection gap discovered
+
+**Problem encountered:** The scan produced no results in Splunk (`index=main host=<ubuntu-desktop-hostname>`).
+
+**Root cause:** Ubuntu Desktop has no local firewall (`ufw`/`iptables`) generating connection-attempt logs, and nothing meaningful was listening on the scanned ports. With no local log source, the Universal Forwarder had nothing to forward — this is a genuine host-layer visibility gap, not a forwarder or Splunk misconfiguration.
+
+**Resolution — checked network-layer detection instead:** pfSense's own firewall log (Status → System Logs → Firewall) showed the scan clearly — logged as **Pass** on OPT1, matching the ATTACK→AD_LAB rule (Log enabled in Entry 003). Confirmed the specific matched rule via the log's expanded detail view.
+
+**Reframed as a finding, not a failure:** host-based detection (Splunk/forwarders) and network-based detection (pfSense firewall logs) cover different blind spots — a scan against a target with no local firewall is invisible to endpoint logging but fully visible at the network boundary. This is the practical reason real environments run both a SIEM and network-level logging/IDS rather than relying on one layer alone.
+
+**Minor side item — unresolved:** pfSense's log display showed timestamps in the wrong timezone (system default, not local). Attempted to correct via System → General Setup, but the display did not actually change despite the setting update — left unresolved rather than reported as fixed. Does not block reading the logs (entries are still correctly ordered and attributable, just labeled with an offset timestamp), but worth revisiting as a small open item rather than treating it as closed.
+
+### Step 4 — Negative test: WAN block confirmed
+
+From Ubuntu Desktop, attempted outbound connectivity (`ping 8.8.8.8` / `1.1.1.1`) — failed as expected. Confirmed in pfSense's firewall log as a **Block** entry on LAN, matching the explicit AD_LAB→WAN rule from Entry 003. Clean contrast against the Pass/Block pair now both captured for the build log and screenshots.
+
+### Step 5 — Attempted fix for the host-layer gap (`ufw` install) — not completed
+
+Attempted to close the Step 3 visibility gap by installing `ufw` on Ubuntu Desktop. This surfaced a long chain of blockers, each correctly diagnosed before moving to the next:
+
+- `ufw: command not found` — checked `dpkg -l | grep ufw`, found status **`rc`** (removed, configuration remaining) — the package had been present at some point and removed, not simply never installed.
+- Attempted to reinstall via `apt`, which requires AD_LAB→WAN access — blocked by design (Entry 003). Considered adding a standing ATTACK→WAN and AD_LAB→WAN rule set mirroring DEFENDER's outbound rules, but reconsidered on least-privilege grounds: DEFENDER's outbound need is continuous (ongoing patching of production-style services), while Kali/AD_LAB's need here was a one-off, and ATTACK specifically carries higher risk as the segment running untrusted/adversarial tooling. Declined to add standing rules for this reason.
+- Explored downloading the package on the host Mac instead, entirely outside the lab network. Ruled out a persistent VirtualBox Shared Folder as leaving a standing host-guest channel open longer than necessary for a one-time transfer; used drag-and-drop instead, which is on-demand only, once Guest Additions were confirmed present.
+- Drag-and-drop failed on Ubuntu Desktop directly (Guest Additions not present/configured) but succeeded on Kali (Guest Additions present on the official Kali image by default).
+- Relaying the file from Kali to Ubuntu Desktop via `scp` failed — Ubuntu Desktop has no SSH server (the same missing-package situation from Step 2, now blocking the fix for Step 3's gap as well).
+- Used `netcat` as a push-based transfer instead (`nc -l` listener on Ubuntu Desktop, `nc` send from Kali) — permitted under the existing ATTACK→AD_LAB allow rule, no new firewall changes needed. Transfer itself completed almost instantly given the small file size, but both terminals appeared to hang — normal `nc` behavior (it doesn't auto-close after EOF without the `-q` flag), not a failed transfer. Confirmed the file had already arrived by checking its size in a separate session before interrupting both hung terminals.
+- `dpkg -i` on the transferred file flagged that installing `ufw` would conflict with **`iptables-persistent`**, the tool actively enforcing the Entry 014 ICMP timestamp remediation on this same VM.
+
+**Decision — stopped rather than proceeded:** installing `ufw` risked overwriting or conflicting with an already-verified, documented security control (Entry 014) for the sake of a visibility enhancement that wasn't required to complete this session's actual goal. Declined the install. `iptables-persistent` remains the system's firewall/logging manager on Ubuntu Desktop, unchanged.
+
+---
+
+**Outcome:** Both core verification tests passed. ATTACK→AD_LAB traffic is detected (at the network layer); AD_LAB→WAN traffic is blocked and logged. The intended host-layer logging enhancement (`ufw`) was not completed, and was deliberately abandoned once it risked a real conflict with existing, verified infrastructure — a legitimate stopping point, not an unresolved failure.
+
+**Lesson learned:** A test that "fails" against one detection layer isn't necessarily a real gap — it may simply reveal which layer is actually doing the work, and checking the other layer before assuming something is broken is the right instinct. Separately, a secondary fix attempted mid-session should be weighed against what it risks breaking elsewhere, not just what it would add — stopping short of a conflict with a previously verified control (Entry 014) was the correct call, even though it left today's enhancement incomplete.
+
+**Real-world relevance:** The host-vs-network detection gap discovered here is a standard, well-known blind spot in real security operations — exactly why defense-in-depth architectures pair endpoint logging with network-level monitoring rather than trusting either alone. The decision to halt a change once it threatened an existing control mirrors real change-management discipline: verifying whether a new configuration conflicts with something already in production before applying it, and being willing to roll back or decline rather than push through a known risk for a lower-priority improvement.
+
+---
+
+## Phase 2, Entry 003 — Session 3: Firewall Rules and DNS Chain
+
+**Date:** July 15, 2026
+**Status:** ✅ Complete
+
+**Action:** Replaced LAN's overly permissive default rule (identified in Entry 002) with an explicit, scoped rule set across all three internal interfaces, then resolved a full chain of downstream consequences that only surfaced once real least-privilege restrictions were in place.
+
+**Goal:** Close the gap flagged at the end of Entry 002 — actual enforcement of the ATTACK/AD_LAB/DEFENDER segmentation, not just interfaces that happened to work because of a leftover permissive default.
+
+---
+
+### Step 1 — Snapshots and pre-work
+
+Applied `phase2-entry003-pre-rules` snapshot naming across all VMs before making changes, per the standing "snapshot before a higher-risk change" practice established in prior sessions. Briefly reviewed pfSense's built-in anti-lockout rule (protects GUI/SSH access to pfSense itself from LAN) — confirmed it operates independently of the custom rule set being written and requires no changes or repositioning.
+
+### Step 2 — Aliases
+
+Created reusable aliases instead of typing raw subnets/ports into every rule:
+- `ATTACK_NET`, `ADLAB_NET`, `DEFENDER_NET` — Type: Network(s)
+- `SPLUNK_FWD` (port 9997) — Type: Ports
+- `WEB_HTTP` (port 80), `WEB_HTTPS` (port 443) — Type: Ports, kept as two separate aliases rather than one combined `WEB` alias, specifically to allow scoping HTTP and HTTPS independently later if desired (e.g., restricting to HTTPS-only as a future hardening step)
+
+### Step 3 — Rule set applied
+
+**OPT1 (ATTACK):**
+- ATTACK → AD_LAB, Protocol: Any — allow (broad scope intentional; ATTACK is the adversary-simulation segment, so restricting protocol here would be artificial)
+- ATTACK → DEFENDER, Protocol: TCP, Port: `SPLUNK_FWD` — allow (covers Kali's optional forwarder, per Design Decision #01)
+
+**LAN (AD_LAB):** default "allow LAN net to any" rule removed first, replaced with:
+- AD_LAB → DEFENDER, Protocol: TCP, Port: `SPLUNK_FWD` — allow
+- AD_LAB → Any, Protocol: Any — explicit block (made explicit rather than relying on implicit default-deny, since this rule is the actual segmentation enforcement worth pointing to directly)
+
+**OPT2 (DEFENDER):**
+- DEFENDER → WAN, Protocol: TCP, Port: `WEB_HTTP` — allow
+- DEFENDER → WAN, Protocol: TCP, Port: `WEB_HTTPS` — allow
+- (Both added as a deliberate choice to allow direct patching of Splunk/Eramba's host, rather than the alternative of leaving DEFENDER fully closed and requiring a temporary rule for every future update — a real trade-off, not an oversight)
+
+### Step 4 — Verification round 1: Splunk dashboard access broke
+
+**Problem encountered:** Splunk's web UI (port 8000) became unreachable from Ubuntu Desktop immediately after the new LAN rules were applied.
+
+**Root cause:** The new AD_LAB→DEFENDER rule was correctly scoped to port 9997 (forwarder traffic) only — port 8000 (the web UI) was never covered, and previously worked only because LAN's old permissive default allowed it by accident.
+
+**Resolution:** Added one more explicit rule — AD_LAB → DEFENDER, TCP, port 8000 — allow. Confirmed dashboard access restored.
+
+### Step 5 — Verification round 2: Kali → AD_LAB ping failed
+
+**Problem encountered:** `ping` from Kali to an AD_LAB host failed despite the ATTACK→AD_LAB allow rule existing.
+
+**Root cause:** The rule's Protocol field had been set to TCP instead of Any — ICMP (ping) isn't TCP, so it fell through to the block. Likely picked up from the adjacent DEFENDER rule directly below it during entry.
+
+**Resolution:** Corrected Protocol to Any. Retested — ping succeeded.
+
+### Step 6 — Verification round 3: DNS chain
+
+**Confirmed working as expected:** Ubuntu Desktop → internet (`ping 8.8.8.8`) failed — correct, confirms the AD_LAB block rule is enforcing.
+
+**Problem encountered:** Testing DEFENDER → internet — `curl` wasn't installed on Ubuntu Server, so used `sudo apt update` instead. Failed with "temporary failure resolving" errors across multiple package sources.
+
+**Root cause (two-part):** (1) Ubuntu Server's Netplan `nameservers` had been deliberately left empty in Entry 002 — correct at the time, since nothing needed hostname resolution yet, but now a real unmet dependency given DEFENDER's new outbound access. (2) No firewall rule existed permitting DNS traffic (port 53) outbound at all.
+
+**Decision — enterprise-mirroring DNS design:** rather than pointing Ubuntu Server directly at a public resolver, chose to centralize DNS the way a real enterprise typically does — internal hosts query an internal resolver, which forwards upstream. pfSense's built-in DNS Resolver (unbound) serves this role. Configured:
+- pfSense System → General Setup → DNS Servers: **9.9.9.9** (Quad9 primary) — chosen specifically for its DNS-layer malicious-domain blocking, a real, defensible security rationale rather than an arbitrary pick
+- Added **149.112.112.112** (Quad9 secondary) for redundancy — same single-point-of-failure reasoning already applied to the DC01/WIN11 DNS dependency in Entry 002
+- Added a DEFENDER → WAN rule, port 53, for DNS traffic
+- Updated Ubuntu Server's Netplan `nameservers` to point at **pfSense's own DEFENDER-segment interface IP** (not Quad9 directly) — keeping DNS resolution routed through the same central enforcement point as everything else in this design
+
+**Problem encountered:** After all of the above, resolution still failed.
+
+**Root cause:** A typo in the configuration (self-identified, not further diagnosed via tooling).
+
+**Resolution:** Corrected the typo. Retested `sudo apt update` — succeeded.
+
+### Step 7 — Patch and reboot verification
+
+Ran `sudo apt upgrade -y`, followed by `sudo apt full-upgrade -y` after the first pass left 20 packages upgradable (expected — `apt upgrade` intentionally won't add/remove dependent packages; `full-upgrade` completes what regular upgrade holds back). Rebooted Ubuntu Server and re-verified Splunk's boot-start persistence (`enable boot-start -user splunk`, set in Entry 002) — confirmed `splunkd` came back up automatically, still running as the `splunk` user, not root.
+
+### Step 8 — Screenshots
+
+Captured the finalized Firewall → Rules views for LAN and OPT1/OPT2 (pairing with the "before" LAN-default-rule screenshot from Entry 001) and the DNS Resolver/General Setup screen showing Quad9 primary/secondary configured.
+
+### Step 9 — Post-verification snapshot
+
+Initially planned to skip a snapshot between Sessions 3 and 4 since all VMs were already running. Reconsidered: the only existing snapshot at that point (`phase2-entry003-pre-rules`) predated the rule set entirely, meaning any rollback need during Session 4 would have undone all of this session's verified work along with whatever went wrong in Session 4. Shut down all six VMs cleanly and applied a new snapshot — `phase2-entry003-rules-verified` — capturing the fully working, documented post-Session-3 state as its own restore point before proceeding.
+
+---
+
+**Outcome:** Segmentation is now actually enforced, not just configured. All three interfaces carry explicit, purpose-built rules; LAN's dangerous permissive default is gone. Splunk dashboard access, Kali-to-AD_LAB connectivity, AD_LAB's internet block, and DEFENDER's scoped outbound access (web + DNS) are all verified working. Ubuntu Server is fully patched with confirmed boot-persistent Splunk.
+
+**Lesson learned:** Nearly every problem this session surfaced was a direct, predictable consequence of previous sessions' correct-at-the-time decisions (Entry 002's empty DNS config) meeting a new requirement (DEFENDER needing real outbound access) — not new mistakes, but dependencies finally being exercised for the first time. The two actual entry errors (TCP instead of Any on the Kali rule; the DNS typo) were both simple, human, and easy to reproduce again — worth explicitly re-checking every new rule's Protocol field individually rather than assuming it carried over correctly from context, going forward.
+
+**Real-world relevance:** This session is close to a textbook firewall-hardening exercise: moving from an implicit permissive default to explicit least-privilege rules, discovering and fixing the real (not hypothetical) breakage that causes, and building a centralized DNS resolution chain through a single enforcement point — mirroring how enterprise networks typically handle DNS rather than letting every host resolve independently. Choosing Quad9 specifically for its security filtering, and adding redundancy proactively rather than after an outage, both reflect deliberate, defensible operational decisions rather than default choices made without reasoning.
+
+---
+
 ## Phase 2, Entry 002 — Session 2: VM Migration onto Segments
 
 **Date:** July 14, 2026
