@@ -91,8 +91,8 @@ The full, dated build log — including what was built, what broke, root cause a
 ├── README.md                    # this file
 ├── build-log.md                 # full dated build log, Phase 1 and Phase 2
 ├── exercise-logs/                # write-ups of individual lab exercises and sessions
-├── grc-artifacts/                 # risk register summaries, framework mappings, policies
-│   └── (Phase 2 additions: control mappings, SOC 2 crosswalk, remediation tracker)
+├── grc-artifacts/                 # risk register summaries, framework mappings
+│   └── risk-register-summary.md   # 3 real findings from credentialed Nessus scan, mapped to NIST CSF/CIS
 ├── screenshots/                  # supporting screenshots referenced in the build log
 └── diagrams/                     # (Phase 2 addition) current network architecture
     └── homelab-network-diagram.html
