@@ -1,4 +1,5 @@
 # Cybersecurity & IT Home Lab
+
 **Built by:** Darryl Briggs
 **Platform:** iMac 2017 · Intel Core i7 (4C/8T) · 48GB RAM · VirtualBox
 **Goal:** Build a fully functional practice environment that replicates real enterprise IT and security infrastructure — hands-on skill-building in support of a career transition into IT and cybersecurity.
@@ -40,7 +41,7 @@ The network is segmented into three isolated zones, with **pfSense** as the only
 |---|---|---|---|
 | **ATTACK** | Adversary simulation | Kali Linux | Rotating |
 | **AD_LAB** | Enterprise identity + endpoints | DC01 (Windows Server — AD DS, DNS), WIN11 (domain workstation), Ubuntu Desktop (Linux target) | Rotating |
-| **DEFENDER** | Logging, monitoring, and governance | Ubuntu Server (Splunk + Universal Forwarders), Eramba (GRC platform) | Splunk: always-on · Eramba: rotating (GRC sessions only) |
+| **DEFENDER** | Logging, monitoring, governance, and controlled egress | Ubuntu Server (Splunk + Universal Forwarders), Eramba (GRC platform), APT-Proxy (apt-cacher-ng) | Splunk: always-on · Eramba: rotating (GRC sessions only) · APT-Proxy: on-demand (AD_LAB patch windows) |
 
 **pfSense** sits with an interface on all three segments (plus WAN/NAT), enforcing rules like *ATTACK → AD_LAB allow*, *AD_LAB → DEFENDER allow (log forwarding)*, *AD_LAB → WAN block*, default deny-all.
 
@@ -60,8 +61,9 @@ A full network diagram with design-decision rationale (including deliberate trad
 | **pfSense** | Firewall / router enforcing network segmentation | ✅ Deployed (Phase 2) |
 | **Splunk Enterprise** | SIEM — log aggregation, correlation, detection | ✅ Deployed, integrated into segmented architecture (Phase 2) |
 | **Nessus Essentials** | Vulnerability scanning | ✅ In active use — full scan/remediate/verify cycles completed |
-| **Eramba** | Open-source GRC platform — risk register, control mapping, policy documents | 🔲 In progress (Phase 2) |
+| **Eramba** | Open-source GRC platform — risk register, control mapping, policy documents | ✅ Deployed (Phase 2) — populated with real credentialed-scan findings |
 | **Kali Linux** | Attack simulation / security tooling | ✅ Deployed |
+| **APT-Proxy (apt-cacher-ng)** | Dedicated internal package proxy — controlled egress for AD_LAB, avoiding a standing internet route | ✅ Deployed (Phase 2) |
 
 ---
 
@@ -69,7 +71,7 @@ A full network diagram with design-decision rationale (including deliberate trad
 
 This lab is mapped to established frameworks rather than built ad hoc:
 
-- **NIST Cybersecurity Framework (CSF) 2.0** — Identify, Protect, Detect, Respond, Govern; Recover addressed via a dedicated backup/restore drill
+- **NIST Cybersecurity Framework (CSF) 2.0** — Identify, Protect, Detect, Respond, Govern; Recover is a known, tracked gap (backup/restore drill scheduled, not yet completed)
 - **CIS Critical Security Controls v8** — secure configuration, vulnerability management, network infrastructure and monitoring, audit log management
 - **NIST SP 800-61** — incident response lifecycle informing the detection → investigation → write-up workflow
 - **MITRE ATT&CK** — detections tagged by technique ID
