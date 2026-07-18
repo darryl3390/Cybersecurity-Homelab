@@ -12,6 +12,77 @@
 
 # Phase 2 — Segmented Architecture
 
+## Phase 2, Entry 005 — Session 5: Eramba Deployment, Credentialed Scanning, and Controlled-Egress Proxy
+
+**Date:** July 16–17, 2026
+**Status:** ✅ Complete
+
+**Action:** Deployed Eramba (Community Edition, via Docker) as the lab's GRC platform, hardened its access, then worked through a credentialed Nessus scan across the AD_LAB segment — which surfaced a real architectural gap (no controlled internet access for AD_LAB hosts) and led to standing up a dedicated internal package-caching proxy as the enterprise-pattern fix. Closed the session by triaging real scan findings into Eramba's risk register.
+
+**Goal:** Complete the last piece of the original pfSense implementation project (Eramba), then use real vulnerability data — not just unauthenticated scan results — to populate the risk register with genuine findings.
+
+---
+
+### Step 1 — Eramba VM and Docker deployment
+
+Created a dedicated Ubuntu Server VM for Eramba (2 vCPU/8GB, matching Eramba's own published spec), placed on `intnet-defender`, static IP with DNS pointed at pfSense's own resolver — same centralized-DNS pattern as every other DEFENDER host.
+
+Chose Docker deployment over Eramba's pre-built OVF appliance after weighing both explicitly: the OVF ships with default OS credentials and an unknown, unverifiable hardening baseline — directly against the "verify everything, trust no default" discipline applied everywhere else in this build. Docker costs more setup time but keeps the OS layer self-built and self-known.
+
+**Problem encountered:** `apt-key`/`add-apt-repository` (used to add Docker's own repo) produced deprecation warnings — `apt-key` and `trusted.gpg` are both deprecated, and store all trusted keys in one shared file trusted for every repository on the system, not just Docker's.
+
+**Resolution:** Replaced with the modern per-repository keyring method — deleted the old key, generated a new one into `/usr/share/keyrings/docker.gpg`, and rewrote the repo's source line to reference it explicitly via `signed-by=`. A leftover source-list entry without the `signed-by=` reference caused a follow-up "public key unavailable" error, traced via `grep -rn "download.docker.com" /etc/apt/` and corrected in place.
+
+Cloned Eramba's official Docker repo, set real (non-default) DB and app passwords in `.env`, declined the HTTP-tunneling prompt during `apt-cacher-ng`'s later install for the same reason — tunneling bypasses firewall restrictions by design, which isn't needed for simple package caching and works against the segmentation model. Ran `docker compose -f docker-compose.simple-install.yml up -d` — all four containers (MySQL, Redis, app, Cron) came up clean.
+
+### Step 2 — GUI access and admin hardening
+
+Same access gap as Splunk's dashboard in Session 3: Ubuntu Desktop (the only VM with a browser) sits on AD_LAB, not DEFENDER. Added one more explicit, scoped LAN rule — `AD_LAB → DEFENDER, TCP 8443` — following the same pattern already used for Splunk's port 8000.
+
+Completed Eramba's first-run setup; confirmed the superadmin username is fixed by the wizard (not a real gap — password is what matters, and a strong, unique one was set). Created a second, named admin account, verified its access, then deactivated (not deleted) the default — identical pattern to pfSense's Entry 001 hardening.
+
+### Step 3 — Credentialed Nessus scan: the AD_LAB internet gap surfaces
+
+Attempting a credentialed scan required getting Nessus's SSH credential working against Ubuntu Desktop — which needed `openssh-server` installed. AD_LAB's Session 3 WAN block (correctly) prevented a direct `apt install`. Also discovered Kali itself has no standing WAN path either (no ATTACK→WAN rule exists) — ruling out the "download on Kali, relay to Ubuntu Desktop" workaround used earlier for `ufw`.
+
+**Decision — build a controlled-egress proxy instead of opening a rule.** Considered a standing ATTACK→WAN rule (same shape as DEFENDER's outbound access) and rejected it: DEFENDER's outbound need is continuous and low-risk; ATTACK's is occasional, and ATTACK specifically carries more risk as the segment running untrusted tooling. Instead, stood up **apt-cacher-ng** on its own new, dedicated VM (not shared with Splunk) — a deliberate least-functionality decision, keeping the SIEM host from also carrying an unrelated proxy service. Verified this matches real enterprise practice: forcing internal hosts through a single controlled proxy for package management, rather than direct internet access, is standard in secured production environments.
+
+Installed cleanly, declined HTTP tunneling as noted above, added one new LAN rule (`AD_LAB → DEFENDER, TCP 3142`), pointed Ubuntu Desktop's `apt` config at the proxy. Verified end-to-end with both a fresh install (`openssh-server`) and a full `apt upgrade`/`full-upgrade` — both pulled cleanly through the proxy with zero direct WAN access from AD_LAB.
+
+### Step 4 — Credentialed scan authentication troubleshooting
+
+**WIN11 auth failure:** traced to UAC Remote Restrictions (`LocalAccountTokenFilterPolicy`) — a documented Windows behavior where domain accounts authenticate fine on a DC but are blocked from remote administrative actions on a regular domain-joined workstation unless this registry key is set. Corrected via registry edit and reboot.
+
+**Ubuntu Desktop auth failure:** resolved once `openssh-server` was actually installed and running (Step 3) — no separate SSH-side misconfiguration once the service existed.
+
+**Problem encountered (real, reproducible Nessus quirk):** even after both hosts authenticated successfully, the scan's summary host-list **Auth column** continued to show "Fail" for both WIN11 and Ubuntu Desktop, while the detailed **"Target Credential Status by Authentication Protocol"** plugin output explicitly confirmed "Valid Credentials Provided" and "no privilege or access problems" / "sufficient privileges for all planned checks" for both hosts. Confirmed reproducible across two independently completed scan runs (a third was intentionally allowed to finish as a final check, matching the two prior results).
+
+**Resolution:** treated the detailed per-protocol plugin output as authoritative over the summary column, given its explicit specificity. Documented as a known Nessus UI/summary discrepancy rather than a real auth problem — not pursued further once the underlying scan data was confirmed sound and consistent across repeated runs.
+
+### Step 5 — Real findings triaged into Eramba's risk register
+
+From the completed credentialed scan (DC01: 232 findings, WIN11: 78, Ubuntu Desktop: 27):
+
+1. **WinVerifyTrust Authenticode validation not enforced (CVE-2013-3900)** — WIN11, High/8.8 CVSS. Treatment: remediate via the documented registry-based strict-validation fix.
+2. **Windows Defender signatures stale (>3 days)** — DC01, High. Root cause traced directly to the lab's own segmentation: DC01/AD_LAB has no WAN access, so Defender cannot reach Microsoft's update servers. Logged as a new item in the Remediation Tracker (#6) — proposed fix mirrors the same controlled-proxy pattern just built for Linux (a scoped temporary AD_LAB→WAN rule during patch windows, or a WSUS-style internal update server on DEFENDER).
+3. **pfSense LAN interface self-signed certificate** — Medium/6.5, both SSL-related Nessus plugin findings tied to the same single certificate. Treatment: **accept** — internal-only management interface on an isolated network; cost of a real certificate or internal CA isn't justified by the actual risk.
+
+All three entered into Eramba with framework mapping (NIST CSF categories) and status.
+
+### Step 6 — Deferred: Eramba/Splunk REST API integration
+
+Investigated bi-directional webhook integration (Splunk detections auto-creating Eramba incidents; Eramba control/risk changes triggering Splunk events). Verified against Eramba's own official documentation rather than a secondhand summary — confirmed the capability is real (REST API, Swagger docs, Basic Auth over TLS, webhooks attached to Eramba's notification/dynamic-status system, not a standalone "automations" page as first described). Deferred as a future project: current data volume doesn't justify automation over manual review, it isn't required by any target certification or job posting, and it competes directly with the GRC content and remediation sprint still outstanding. Logged as an optional future-project item with full rationale.
+
+---
+
+**Outcome:** Eramba fully deployed, hardened, and populated with three genuine, credentialed-scan-sourced risk register entries. A real architectural gap (AD_LAB has no controlled path for security updates) was discovered as a direct byproduct of trying to run a scan, and addressed with an enterprise-pattern fix (a dedicated, least-privilege internal proxy) rather than a firewall rule that would have undermined the segmentation model. A second, parallel finding (DC01's stale Defender signatures) shows that same gap already causing a real, current security consequence — logged for future remediation rather than fixed same-session.
+
+**Lesson learned:** Two of tonight's most valuable outcomes came from resistance, not from things going smoothly — Ubuntu Desktop's SSH install failing pushed toward building a proper controlled-egress solution instead of a one-off workaround, and DC01's stale Defender signatures turned an abstract architectural decision (AD_LAB has no WAN access) into a concrete, current finding. Friction that surfaces a real gap is more valuable than friction that's just solved and forgotten — worth documenting the "why," not just the "what," in both cases.
+
+**Real-world relevance:** Standing up a dedicated caching/egress proxy specifically to avoid opening broad internet access from a security-conscious network segment is textbook enterprise network architecture, not a lab workaround. The WinVerifyTrust and stale-signature findings are both real, current, well-documented Windows vulnerability classes — the kind actually seen in production vulnerability management programs, not synthetic lab-only issues. And discovering that your own segmentation design has a real maintenance cost (patching becomes harder, not just attacking) is an accurate reflection of the genuine trade-off every real segmented network makes.
+
+---
+
 ## Phase 2, Entry 004 — Session 4: Positive/Negative Detection Testing
 
 **Date:** July 15, 2026
