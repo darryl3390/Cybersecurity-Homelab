@@ -1,0 +1,69 @@
+# Risk Register Summary
+
+Sanitized summary of risk register entries maintained in this lab's GRC platform (Eramba). Full tracking — including remediation ownership and internal notes — is maintained privately; this document reflects the substance of each entry for portfolio purposes. Structure follows standard risk register practice (NIST SP 800-30 / ISO 27005 format: identification, assessment, treatment, residual risk, review cycle).
+
+All entries sourced from real, credentialed Nessus vulnerability scans against the lab's AD_LAB segment (Phase 2, Entry 005), not synthetic or hypothetical findings.
+
+---
+
+## R-001 — Authenticode Signature Validation Not Enforced
+
+| Field | Value |
+|---|---|
+| **Asset** | WIN11 (domain workstation) |
+| **Identified** | July 16–17, 2026 |
+| **Status** | In Remediation |
+| **Finding** | Windows does not enforce strict Authenticode signature validation by default (CVE-2013-3900 / WinVerifyTrust). An attacker can append malicious content to a legitimately signed file without invalidating its signature — the file still appears validly signed while containing tampered content. |
+| **Severity** | High (CVSS 8.8) |
+| **Likelihood** | Medium — requires an existing delivery path or foothold; not remotely exploitable on its own |
+| **Impact** | High — undermines a foundational OS trust mechanism (code-signing verification) |
+| **Treatment** | **Remediate** — enable strict WinVerifyTrust validation via the documented registry-based fix |
+| **Residual Risk (post-treatment)** | Low — once enforced, this closes the specific bypass entirely; no known compatibility issues for this environment |
+| **Next Review** | Upon remediation completion |
+| **Framework Mapping** | NIST CSF: PR.DS-6 (Integrity Checking Mechanisms) · CIS Control 4 (Secure Configuration) |
+
+---
+
+## R-002 — Windows Defender Signatures Stale (Root Cause: Network Segmentation)
+
+| Field | Value |
+|---|---|
+| **Asset** | DC01 (domain controller) |
+| **Identified** | July 16–17, 2026 |
+| **Status** | In Remediation |
+| **Finding** | Windows Defender antimalware signatures had not updated in over 3 days at time of scan. Root cause traced directly to the lab's own network segmentation: DC01 sits in a segment with no outbound internet access by design, so Defender cannot reach Microsoft's update servers. |
+| **Severity** | High |
+| **Likelihood** | Medium — stale signatures don't create an active exploit path directly, but meaningfully reduce detection of newer malware variants |
+| **Impact** | High — a core endpoint defense control is degraded across every host in the affected segment, not just this one machine |
+| **Treatment** | **Remediate** — extend the same controlled-egress pattern already built for Linux hosts (a dedicated internal package proxy) to Windows: either a scoped, temporary outbound allow rule during defined patch windows, or an internal WSUS-style update server on the monitoring segment |
+| **Residual Risk (post-treatment)** | Low — a controlled, logged update path restores detection currency without reopening standing internet access to the segment |
+| **Next Review** | Upon remediation completion; re-verify signature currency monthly thereafter |
+| **Framework Mapping** | NIST CSF: PR.MA-1 (Maintenance) · DE.CM-4 (Malicious Code Detection) · CIS Control 10 (Malware Defenses) |
+| **Note** | This finding is a direct, real consequence of a deliberate architectural decision (segmentation), not an oversight — identified while running a routine vulnerability scan, and tracked as a genuine trade-off between security posture and maintainability rather than something to quietly patch around. |
+
+---
+
+## R-003 — Self-Signed Certificate on Firewall Management Interface
+
+| Field | Value |
+|---|---|
+| **Asset** | Network firewall/router — internal management interface |
+| **Identified** | July 16–17, 2026 |
+| **Status** | Accepted |
+| **Finding** | The management GUI uses a default self-signed certificate, not signed by a recognized Certificate Authority. |
+| **Severity** | Medium (CVSS 6.5) |
+| **Likelihood** | Low — exploitation would require an attacker already positioned on the internal network with the ability to intercept traffic to this specific internal management interface |
+| **Impact** | Low, in this context — this is a private, internal-only management interface, not a public-facing production service |
+| **Treatment** | **Accept** — documented rationale: the cost of a purchased certificate or standing up an internal Certificate Authority is not justified by the realistic risk to an internal-only, isolated-network management interface |
+| **Residual Risk (accepted)** | Low — bounded by network isolation; no plan to remediate unless the interface's exposure changes |
+| **Next Review** | Annually, or immediately if this interface is ever exposed beyond the current isolated segment |
+| **Framework Mapping** | NIST CSF: ID.RA-1 (Risk Assessment) — demonstrates the finding was evaluated and consciously accepted, not overlooked |
+
+---
+
+## Framework Coverage Summary
+
+| Framework | Entries Mapped |
+|---|---|
+| NIST CSF 2.0 | PR.DS-6, PR.MA-1, DE.CM-4, ID.RA-1 |
+| CIS Controls v8 | Control 4, Control 10 |
