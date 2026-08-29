@@ -63,6 +63,9 @@ A full network diagram with design-decision rationale (including deliberate trad
 | **Eramba** | Open-source GRC platform — risk register, control mapping, policy documents | ✅ Deployed (Phase 2) — populated with real credentialed-scan findings |
 | **Kali Linux** | Attack simulation / security tooling | ✅ Deployed |
 | **APT-Proxy (apt-cacher-ng)** | Dedicated internal package proxy — controlled egress for AD_LAB, avoiding a standing internet route | ✅ Deployed (Phase 2) |
+| **Wazuh** | EDR — host-level detection (Sysmon on Windows endpoints, auditd on Linux endpoints), centralized configuration management | ✅ Deployed (Phase 2) — all four endpoints reporting, findings integrated into Splunk |
+| **DISA STIG / OpenSCAP** | Compliance auditing — manual STIG review (STIG Viewer) and automated scanning (OpenSCAP) against Ubuntu hardening benchmarks | ✅ In active use — automated scan pipeline working; manual review ongoing |
+| **Metasploitable2** | Deliberately vulnerable target VM, isolated to the ATTACK segment | ✅ Deployed — used to validate real detection coverage; confirmed one honest telemetry gap (see build log Entry 007) |
 
 ---
 
