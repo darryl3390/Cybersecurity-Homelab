@@ -1,5 +1,4 @@
 # Cybersecurity & IT Home Lab
-
 **Built by:** Darryl Briggs
 **Platform:** iMac 2017 · Intel Core i7 (4C/8T) · 48GB RAM · VirtualBox
 **Goal:** Build a fully functional practice environment that replicates real enterprise IT and security infrastructure — hands-on skill-building in support of a career transition into IT and cybersecurity.
@@ -39,9 +38,9 @@ The network is segmented into three isolated zones, with **pfSense** as the only
 
 | Segment | Purpose | VM(s) | Tier |
 |---|---|---|---|
-| **ATTACK** | Adversary simulation | Kali Linux | Rotating |
+| **ATTACK** | Adversary simulation | Kali Linux, Metasploitable2 (deliberately vulnerable target) | Rotating |
 | **AD_LAB** | Enterprise identity + endpoints | DC01 (Windows Server — AD DS, DNS), WIN11 (domain workstation), Ubuntu Desktop (Linux target) | Rotating |
-| **DEFENDER** | Logging, monitoring, governance, and controlled egress | Ubuntu Server (Splunk + Universal Forwarders), Eramba (GRC platform), APT-Proxy (apt-cacher-ng) | Splunk: always-on · Eramba: rotating (GRC sessions only) · APT-Proxy: on-demand (AD_LAB patch windows) |
+| **DEFENDER** | Logging, monitoring, governance, controlled egress, and endpoint detection | Ubuntu Server (Splunk + Universal Forwarders), Wazuh Manager (EDR), Eramba (GRC platform), APT-Proxy (apt-cacher-ng) | Splunk & Wazuh: always-on · Eramba: rotating (GRC sessions only) · APT-Proxy: on-demand (AD_LAB patch windows) |
 
 **pfSense** sits with an interface on all three segments (plus WAN/NAT), enforcing rules like *ATTACK → AD_LAB allow*, *AD_LAB → DEFENDER allow (log forwarding)*, *AD_LAB → WAN block*, default deny-all.
 
@@ -97,3 +96,4 @@ The full, dated build log — including what was built, what broke, root cause a
 └── diagrams/                     # (Phase 2 addition) current network architecture
     └── homelab-network-diagram.html
 ```
+
