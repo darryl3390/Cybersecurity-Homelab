@@ -1,7 +1,6 @@
 # Homelab Build Log
 
 *Ordered newest first. New entries are added at the top of their phase's section going forward.*
-
 **Owner:** Darryl Briggs  
 **Goal:** Build a functioning enterprise-style network to develop hands-on cybersecurity and IT skills in support of CompTIA certifications and a career transition into GRC and cybersecurity engineering.  
 **Host:** iMac 2017 — Intel Core i7 — 48GB RAM — VirtualBox  
@@ -11,6 +10,222 @@
 ---
 
 # Phase 2 — Segmented Architecture
+
+## Phase 2, Entry 008 — Session 8: Wazuh-to-Splunk Integration, Actually Verified and Fixed
+
+**Date:** August 27, 2026
+**Status:** ✅ Complete — Wazuh alert data confirmed flowing into Splunk
+
+**Action:** Returned to verify whether Wazuh's findings were genuinely reaching Splunk, following Entry 007's premature "confirmed working" claim. They weren't. Traced the real cause through a full chain of individually-ruled-out possibilities to the actual, final root cause.
+
+**Goal:** Get real, verified Wazuh alert data landing in Splunk — not just configuration commands that ran without error.
+
+---
+
+### The diagnostic chain, in order, each step ruling out one real possibility
+
+1. **Checked whether the forward-server destination was even active:**
+   ```bash
+   sudo /opt/splunkforwarder/bin/splunk list forward-server
+   ```
+   Showed `Active forwards: 10.10.30.10:9997` — genuinely active. Ruled out: destination not configured.
+
+2. **Searched Splunk for any Wazuh-sourced data** — nothing found, confirming the actual symptom was real, not a search-syntax issue.
+
+3. **Noticed Wazuh's own API showing "Offline"** on the dashboard's API Connections page — investigated as a possible cause. Confirmed via `systemctl status wazuh-manager` and a direct `alerts.json` timestamp check that the **core manager was healthy and actively writing real alerts** — the API being down was a separate, unrelated issue (affects dashboard config actions, not alert generation or the file itself). Ruled out.
+
+4. **Checked Splunk's receiving side directly:**
+   ```bash
+   sudo ss -tulnp | grep 9997
+   ```
+   Confirmed `splunkd` genuinely listening on `0.0.0.0:9997`. Ruled out: receiving side not listening.
+
+5. **Tested the raw network path directly, bypassing both Splunk and Wazuh's own reporting:**
+   ```bash
+   nc -zv 10.10.30.10 9997
+   ```
+   Succeeded. Also checked the Wazuh manager VM's own `iptables -L OUTPUT` — default `ACCEPT`, no blocking rules. Ruled out: network/firewall path.
+
+6. **Checked the forwarder's actual `outputs.conf` on disk** (not trusting the CLI's report of it) — genuinely correct, `server = 10.10.30.10:9997` present and accurate.
+
+7. **Checked the forwarder's `inputs.conf` on disk — found the real root cause:** the file **did not exist at all.** The earlier `add monitor` command (Entry 007, after fixing the shell-quoting bug) had appeared to succeed with no error, but never actually persisted a monitor definition to disk. The forwarder had a correct destination and nothing whatsoever telling it to watch `alerts.json`.
+
+### The fix
+
+Created the file directly rather than trusting the CLI a second time:
+```bash
+sudo mkdir -p /opt/splunkforwarder/etc/system/local
+sudo nano /opt/splunkforwarder/etc/system/local/inputs.conf
+```
+```ini
+[monitor:///var/ossec/logs/alerts/alerts.json]
+disabled = false
+sourcetype = wazuh_alerts
+index = main
+```
+Restarted the forwarder, then verified with real data in Splunk:
+```
+index=main sourcetype=wazuh_alerts
+```
+Confirmed: real Wazuh alert data now populating Splunk.
+
+---
+
+**Outcome:** Wazuh's own findings are now genuinely, verifiably unified into Splunk — not assumed, actually confirmed with real returned events. Six independent possibilities were checked and ruled out in sequence (destination config, manager health, receiving port, network path, output config) before the actual cause (a silently-failed monitor write) was found.
+
+**Lesson learned:** A CLI command returning no error is not the same as a config change actually persisting to disk. This is the second time this exact class of gap has shown up tonight in different forms (the earlier API-timeout/YAML crash also stemmed from a config edit not behaving as expected) — when a tool's own reporting can't be fully trusted, checking the actual file on disk is the more reliable ground truth. Also worth remembering: don't mark something "confirmed working" in documentation until the actual downstream result has been checked, not just the command that was supposed to produce it — Entry 007's premature claim here is exactly the kind of gap this whole build log has otherwise been careful to catch.
+
+**Real-world relevance:** This is precisely what real troubleshooting under uncertainty looks like — a genuine chain of elimination across every layer of a data pipeline (source, transport, network, destination), rather than guessing at the first plausible cause. The specific failure mode (a CLI reporting success while silently not writing its config) is a real, transferable lesson for working with any tool whose state you can't fully verify without checking the underlying files directly.
+
+---
+
+## Phase 2, Entry 007 — Session 7: Wazuh EDR Deployment Across the Environment
+
+**Date:** August 24, 2026
+**Status:** ✅ Complete (Wazuh manager, four agents, Sysmon, auditd, centralized config) — ⬜ Deferred (Metasploitable2 exploitation test, DC01-specific monitoring group, Wazuh-to-Splunk integration verification — see Entry 008)
+
+**Action:** Deployed Wazuh as a full EDR layer across the environment — a dedicated manager, agents on all four existing endpoints (both Linux hosts, both Windows hosts), Sysmon on the Windows side, auditd on the Linux side, and centralized configuration via Wazuh groups. A Splunk Universal Forwarder was also configured on the Wazuh manager to feed its findings back into the SIEM, though this integration wasn't actually verified working until Entry 008.
+
+**Goal:** Move beyond network-layer detection (Splunk + pfSense) into genuine host-level EDR — real process, file integrity, and syscall visibility on every endpoint, correlated through Wazuh and unified back into Splunk as the single pane of glass.
+
+---
+
+### Step 1 — Wazuh manager: new dedicated VM, DEFENDER segment
+
+Built a fresh Ubuntu Server VM (8GB RAM, 50GB disk intended) specifically for Wazuh, kept separate from Splunk's existing host given Wazuh's real resource footprint (indexer + server + dashboard together).
+
+**Real install friction, in order:**
+- Initial install attempt used a literal `4.x` in the install script URL — corrected to the actual current version path (`4.14`) after verifying against Wazuh's own documentation
+- A `-O` vs `-0` typo (letter O vs. zero) on the `curl` command caused the install script to print to the terminal instead of saving to a file — corrected
+- Post-install, `systemctl status wazuh.service` / `dashboard.service` both returned "could not be found" — real services were running under different unit names (`wazuh-manager.service`, `wazuh-dashboard.service`), confirmed via `systemctl list-units | grep wazuh`, not an actual failure
+
+### Step 2 — Real disk sizing bug found and fixed
+
+The dashboard began throwing `TOO_MANY_REQUESTS / disk usage exceeded flood-stage watermark` errors — OpenSearch's own safety mechanism locking indices read-only under disk pressure. `df -h` confirmed the root cause: the VM's logical volume was only **29GB**, not the 50GB intended at creation — a real, known Ubuntu installer quirk where LVM under-allocates relative to the actual virtual disk. Fixed via `lvextend -l +100%FREE` and `resize2fs`, recovering the full disk without rebuilding the VM.
+
+### Step 3 — Firewall rules for Wazuh, added deliberately and scoped
+
+Three new rules, `AD_LAB → DEFENDER`, matching the same least-privilege pattern as every other rule in this build:
+- TCP 443 — dashboard access
+- TCP+UDP 1514 — agent-to-manager communication
+- TCP 1515 — agent enrollment
+
+All confirmed against Wazuh's own current documentation before adding, rather than assumed from memory.
+
+### Step 4 — Ubuntu Desktop agent: a real, deliberate proxy policy exception
+
+Attempting to install the agent via `apt` failed with `403 CONNECT denied` — traced to a decision made back in Session 5, where apt-cacher-ng's HTTP tunneling was deliberately disabled to prevent proxy-based firewall bypass. Rather than reverting that decision broadly, added a single scoped exception in apt-cacher-ng's config (`PassThroughPattern: ^packages\.wazuh\.com:443$`), preserving the original security intent while permitting this one legitimate case.
+
+### Step 5 — Splunk VM agent: no relay needed
+
+Since Splunk's VM already sits on DEFENDER with its own real WAN access (Session 3), the agent installed directly, no proxy or relay required — the one genuinely simple deployment of the whole session.
+
+### Step 6 — auditd on both Linux hosts, and a corrected assumption
+
+Initially assumed Wazuh auto-configures auditd rules on connection — incorrect. Confirmed via research that Wazuh and auditd are two independent systems: Wazuh reads whatever auditd is told to watch, but does not define those rules itself. Corrected by manually writing a real rule set (identity file watches, `execve` tracking) directly via `auditctl`/`augenrules`.
+
+### Step 7 — Centralized configuration, and a real manager crash along the way
+
+Built a `linux` Wazuh group to centrally push the auditd `<localfile>` config to both Linux agents, rather than hand-editing `ossec.conf` per host.
+
+**A real, serious problem surfaced attempting this:** dashboard config saves began failing with API timeouts. Diagnosed via `api.log`, which showed the *save itself* succeeding, but a separate automatic follow-up call (`/manager/configuration/validation`) consistently timing out at 10 seconds. Attempted to raise the API's `request_timeout` — this **crashed the Wazuh manager entirely**, traced via `journalctl` to a YAML syntax error: the new `request_timeout: 30` value had been added under a still-commented-out parent key (`# intervals:`), producing an orphaned, invalid config the API refused to start against. Corrected by uncommenting both the parent and child keys together; manager restarted cleanly with the longer timeout active.
+
+### Step 8 — DC01 agent and Sysmon: the most friction of any single endpoint tonight
+
+- Netcat-based relay (the method used all night for Linux file transfers) doesn't work for Windows, which has no built-in `nc` — switched to a VirtualBox Shared Folder instead, a cleaner, network-independent method
+- Running the agent MSI without the `/q` silent flag opened a manual GUI enrollment tool instead of installing normally — corrected by using the proper silent install command
+- The manager address landed as `0.0.0.0` post-install rather than the real IP — same class of bug seen earlier on Ubuntu Desktop — fixed via direct `ossec.conf` edit
+- Attempted `Enable-WindowsOptionalFeature -FeatureName Sysmon` to install Sysmon — this is not a real Windows feature; the command "succeeded" while installing nothing at all
+- The actual Sysmon executable had never been downloaded, only the config file — corrected
+- The SwiftOnSecurity config download turned out to be a corrupted HTML error page saved with an `.xml` extension, not real config content — caught via Sysmon's own parser error, corrected by pulling the raw file directly from GitHub rather than a rendered page
+
+### Step 9 — "windows" Wazuh group, DC01 added, config confirmed pushed
+
+Created deliberately parallel to the `linux` group, holding the shared Sysmon `<localfile>` config both Windows hosts would need.
+
+### Step 10 — WIN11 agent and Sysmon: same process, genuinely faster
+
+Every failure mode from DC01 was already known — silent install flag used from the start, manager address verified immediately, Sysmon config file-content verified (`head -5`) before transfer rather than after a failure. Added to the `windows` group; centralized config confirmed pushed correctly.
+
+### Step 11 — Wazuh-to-Splunk integration: closing the loop
+
+Realized mid-session that Wazuh's own findings were not actually flowing into Splunk, despite an earlier assumption that they were — corrected directly rather than left standing. Installed Splunk Universal Forwarder on the Wazuh manager VM itself (not an `apt` package — required a direct, account-gated download from Splunk, unlike Wazuh's own repository-based install).
+
+**Real troubleshooting to get it working:**
+- `add monitor` initially failed with a misleading "event not found" error against `/var/ossec/logs/alerts/alerts.json`
+- First suspected and ruled out: wrong Splunk credentials, then group-membership/permissions (partially correct — the forwarder's user did need adding to the `wazuh` group to read the file at all)
+- The actual final root cause: special characters in the Splunk password being mishandled by the shell before ever reaching the `add monitor` command — resolved by single-quoting the `-auth` argument
+- Configuration commands completed without error — `add monitor`, `add forward-server` (10.10.30.10:9997), `splunk restart` — but **actual data flow was never verified before ending the session.** This turned out to matter: see Entry 008 for what was actually still broken.
+
+---
+
+**Outcome:** Full EDR coverage now exists across all four endpoints — Sysmon on the Windows hosts, auditd on the Linux hosts, centralized configuration management proven working across two groups, and Wazuh's own analysis now unified into Splunk rather than sitting in a separate, disconnected dashboard. The manager survived a real crash (a self-inflicted YAML error) and a real disk-sizing bug, both fully diagnosed and resolved rather than patched around.
+
+**Lesson learned:** Several of tonight's hardest problems were caused by fixes for *other* problems — the manager crash came from fixing the API timeout; the "event not found" error looked like a permissions issue and partially was, but the real final cause was a shell-quoting problem underneath it. Layered debugging like this rewards checking one variable at a time rather than changing several things and hoping — nearly every dead end tonight resolved once isolated properly rather than guessed at.
+
+**Real-world relevance:** This is what real EDR rollout actually looks like at small scale — not a single clean deployment, but per-platform quirks (Windows vs. Linux transfer methods, install flags, config validation), a genuine infrastructure bug in the manager itself, and the often-overlooked step of actually unifying a new tool's output with existing detection infrastructure rather than letting it become one more disconnected dashboard.
+
+---
+
+## Phase 2, Entry 006 — Session 6: Log Forwarding, Host Firewall Regression, and DISA STIG Automation
+
+**Date:** August 23–24, 2026
+**Status:** ✅ Complete (log forwarding, Ubuntu STIG automation) — ⬜ Deferred (Windows STIG auditing)
+
+**Action:** Configured pfSense-to-Splunk log forwarding, caught and resolved a real host-level firewall regression on the Splunk VM discovered in the process, then pursued automated DISA STIG compliance scanning against Ubuntu Server — working through a chain of real, independent tooling issues to reach a genuine, defensible conclusion.
+
+**Goal:** Eliminate the manual cross-checking between pfSense's own log viewer and Splunk by forwarding firewall events directly into the SIEM, then move DISA STIG auditing from a slow manual process into an automated one.
+
+---
+
+### Step 1 — pfSense → Splunk log forwarding
+
+Enabled Remote Logging on pfSense (Status → System Logs → Settings), pointed at Splunk's IP on a UDP data input. Straightforward to configure, but exposed a real, independent problem the moment testing began.
+
+### Step 2 — Problem encountered: host firewall regression on the Splunk VM
+
+**Root cause:** at some earlier point, removing `ufw` on this VM left orphaned-but-still-functional iptables chains behind — real traffic counters proved they'd been active — while silently reverting the effective policy to `ACCEPT` by default. The one existing rule (permitting port 6514) was the only thing standing between this host and a fully open `INPUT` chain.
+
+**Resolution, in order:**
+1. Flushed all leftover ufw chains (`iptables -F`, `-X`) rather than append new rules on top of stale scaffolding
+2. Deliberately declined to add SSH back in — confirmed this VM has only ever been managed via VirtualBox console, so reopening port 22 would have been unnecessary standing attack surface, not a real requirement
+3. Rebuilt explicit allow rules (established/related, loopback, Splunk web UI, forwarder port, syslog port) *before* flipping the default policy to `DROP` — same anti-lockout discipline as pfSense's own built-in protection
+4. **Second problem encountered:** after the rebuild, syslog forwarding broke again — root cause was a protocol mismatch, the rebuilt port 6514 rule was accidentally created as TCP instead of UDP, silently failing to match pfSense's actual traffic
+5. Corrected to UDP, verified real traffic arriving, saved the ruleset persistently (`netfilter-persistent save`)
+
+### Step 3 — DISA STIG manual review, then a decision to automate
+
+Installed STIG Viewer 3 (now an Electron application, not Java-based) via the established Mac → Kali → netcat relay pattern, since AD_LAB has no path to `public.cyber.mil`. Hit and resolved two independent issues along the way: a corrupted transfer requiring a retry, and an Electron sandbox failure inside the VM resolved with `--no-sandbox`. Imported the Ubuntu STIG benchmark and began manual review — with 200+ individual findings, decided a manual pass alone wasn't the efficient path forward and pursued automation instead.
+
+### Step 4 — SCC attempted, correctly abandoned
+
+Installed DISA's official SCC tool (5.14.1) via the same relay method. Discovered no Ubuntu-specific SCAP content is published for SCC's ecosystem (its published content is overwhelmingly RHEL/SLES/Oracle-Linux focused). Cleanly uninstalled rather than force a mismatched tool onto the task.
+
+### Step 5 — OpenSCAP: a real, multi-layered troubleshooting chain
+
+**Problem 1:** `apt install` reported packages as unable to locate. **Root cause:** the `universe` repository wasn't enabled on this VM. Enabled it, resolved.
+
+**Problem 2:** first scan attempt failed outright — `oscap` couldn't find its expected default CPE dictionary file. **Root cause:** confirmed as a long-documented, real OpenSCAP packaging gap (tracked publicly for years, still recurring in current reports) — the package simply doesn't ship this file. Fixed by creating a minimal, schema-correct placeholder, cross-checked against OpenSCAP's actual real source file structure rather than guessed blind.
+
+**Problem 3:** the scan then completed but scored 0% with "no rules evaluated." **Root cause:** the placeholder CPE dictionary was too minimal to support the platform-applicability check `oscap` runs before testing anything. Fixed by pointing the scan explicitly at the real, content-specific CPE dictionary shipped alongside the Ubuntu datastream itself (`--cpe` flag), rather than relying on the generic default path.
+
+**Problem 4:** the scan then completed but marked every single rule "Not Applicable." **Root cause, verified through direct research rather than assumption:** the host runs Ubuntu 26.04, but no SCAP content exists for that release anywhere — confirmed by checking the SSG project's own release history, Ubuntu's package archives, and independent current guides, none of which show anything past 24.04. Investigated further and found a genuine, structural reason: Ubuntu 26.04 appears to be a short-support interim release, not an LTS — compliance-content projects deliberately prioritize LTS releases, since those are what's actually deployed in production for years. This is an external scope gap, not a temporary omission.
+
+**Resolution:** ran the scan using the 24.04 datastream as a deliberate, documented substitute (one LTS cycle removed, same core architecture), rather than continuing to chase a fix for content that doesn't exist. A same-version `os-release` edit workaround was also attempted and did not resolve the issue, consistent with this being a genuine content gap rather than a version-string detection problem.
+
+### Step 6 — Report access
+
+Hit two final, minor issues viewing the completed report: files owned by `root` from the `sudo`-executed scan (fixed via `chown`/`chmod` on both the file and its directory), then a GTK/Firefox display issue opening the HTML report (resolved by using `w3m`, a text-based browser, instead).
+
+---
+
+**Outcome:** Splunk now receives pfSense's firewall events directly, closing the manual cross-checking gap from Session 4. A real, previously-unknown host firewall regression on the Splunk VM was found and corrected — arguably the most important single fix of this session, since it had left one of the lab's most sensitive hosts silently unprotected at the network-adjacent layer. DISA STIG auditing against Ubuntu Server is functioning end-to-end, automated, with a clearly documented methodology note about the 24.04-for-26.04 substitution and why it's necessary. Windows-side STIG auditing (WIN11, DC01) remains outstanding — deferred to a future session.
+
+**Lesson learned:** Nearly every problem this session surfaced was a real, independent issue, not one root cause wearing different masks — a stale package removal silently weakening a firewall, a missing file in a mature open-source tool, an under-specified default breaking a downstream check, and a genuine content-availability gap tied to a release's support tier. Treating each as its own problem, verified rather than assumed, was what actually closed all of them out rather than compounding a wrong guess. Worth remembering: a plausible-sounding explanation for a failure ("edit the version string") isn't the same as the actual root cause, and testing that gap honestly (checking whether the fix worked, not assuming it should have) mattered more than any individual fix.
+
+**Real-world relevance:** Discovering a host firewall silently reverted to permissive-by-default, well after the fact, is precisely the kind of gap real security audits exist to catch — and catching it here came from the same instinct (verify, don't assume) that any real compliance or SOC review depends on. The DISA STIG automation chain, meanwhile, is a realistic picture of what real compliance tooling work actually involves: not a single clean command, but a sequence of genuine environment-specific issues, each requiring its own diagnosis, each resolved on its own evidence rather than a guess.
+
+---
 
 ## Phase 2, Entry 005 — Session 5: Eramba Deployment, Credentialed Scanning, and Controlled-Egress Proxy
 
